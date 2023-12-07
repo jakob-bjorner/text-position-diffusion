@@ -18,8 +18,6 @@ import torch
 import torch.distributed.optim
 import torch.nn.functional as F
 import tqdm
-import wandb
-import subprocess
 from torch import nn, optim, autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -35,8 +33,6 @@ def main(**args):
     args.setdefault('lr_decay', True)
     args.setdefault('print_freq', 1000)
     args.setdefault('save_weights', True)
-    args.setdefault('model_save_path', '')
-    args.setdefault('wandb_run_name', '')
     args.setdefault('steps', 92000)
     args.setdefault('weights_path', None)
     args.setdefault('reconst_weight', 1.0)
@@ -61,24 +57,7 @@ def main(**args):
     args.setdefault('clip_quantile', 0.95)
     args.setdefault('reconst_bs_ema', 0.997)
     args.setdefault('final_val_steps', 3000)
-    args.setdefault('wandb_project_name', "text-diffusion-plaid-replication")
-    args.setdefault('diffusion_mode', "token") # token or BoW
-    args.setdefault('BoW_cumsum_gamma', 1.0)
-    args.setdefault('debug', False)
-    args.setdefault('steps_max_for_lr_sched', None)
-    args.setdefault('lr_scheduler', 'linear') # linear or cosine
-    args.setdefault('reconst_secondary_weight', 1.0)
-    args.setdefault('weight_decay_embed', 0.0)
 
-    args.BoW_cumsum_gamma = float(args.BoW_cumsum_gamma)
-
-    assert args.lr_scheduler in ["linear", "cosine"], "scheduler for annealing must be linear or cosine"
-    assert "token" in args.diffusion_mode or "BoW" in args.diffusion_mode, "diffusion_mode must be token or BoW"
-    assert not os.path.exists(args.model_save_path) or args.auto_resume, "must save to a new directory else will start from save"   
-    if args.steps_max_for_lr_sched is None:
-        args.steps_max_for_lr_sched = args.steps
-    if args.wandb_run_name == "":
-        args.wandb_run_name = args.model_save_path
     lib.utils.print_args(args)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -97,13 +76,13 @@ def main(**args):
 
     vocab_size = len(word2idx)
     print(f'vocab_size: {vocab_size}')
-    run = wandb.init(project=args.wandb_project_name, config=args, name=f"{args.wandb_run_name}")
+
     def create_modules(dim, n_heads):
         return {
             'noise_schedule': lib.models.NoiseSchedule().float(),
             'gamma_bounds': lib.models.GammaBounds(args.gamma_0, args.gamma_1).float(),
             'embedding_matrix': lib.models.EmbeddingMatrix(vocab_size, args.embed_dim).float(),
-            'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, vocab_size, diffusion_mode=args.diffusion_mode).float()
+            'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, vocab_size).float()
         }
     modules = create_modules(args.dim, args.n_heads)
     base_modules = create_modules(256, 4)
@@ -127,30 +106,25 @@ def main(**args):
         assert(args.save_weights)
 
     first_step = args.first_step
-    if args.auto_resume and os.path.exists(os.path.join(args.model_save_path, 'model.pt')):
-            load_weights(args.model_save_path)
-            with open(os.path.join(args.model_save_path, 'step'), 'r') as f:
+    if args.auto_resume and os.path.exists('model.pt'):
+            load_weights('.')
+            with open('step', 'r') as f:
                 first_step = int(f.read()) + 1
     elif args.weights_path is not None:
         load_weights(args.weights_path)
 
     print(f'Starting from step {first_step}')
 
-    if args.debug:
-        ddp_modules = {
-            name: module
-            for name, module in modules.items()
-        }
-    else:
-        ddp_modules = {
-            name: DDP(module, broadcast_buffers=False,
-                find_unused_parameters=True,
-                gradient_as_bucket_view=True
-            )
-            for name, module in modules.items()
-        }
+    ddp_modules = {
+        # name: DDP(module, broadcast_buffers=False,
+        #     find_unused_parameters=True,
+        #     gradient_as_bucket_view=True
+        # )
+        name: module
+        for name, module in modules.items()
+    }
 
-    print('DDP initialized')
+    # print('DDP initialized')
 
     emas = {
         name: lib.ema.EMA(module, args.ema)
@@ -168,7 +142,6 @@ def main(**args):
     reconst_sqr_ema   = torch.tensor(1e-8)
     diffusion_sqr_ema = torch.tensor(1e-8)
     reconst_bs_cache  = {}
-    wandb.watch(ddp_modules["model"]) 
     def forward(step=None, accum_step=None, accum_total=None, x_eval=None):
         """
         Train mode: step, accum_step, accum_total
@@ -215,7 +188,7 @@ def main(**args):
                 selfcond_mask.add_(1)
                 avg_selfcond_mask = 1.
 
-        t = torch.empty([batch_size], device='cuda')
+        t = torch.empty([batch_size], device='cuda') # Jakob: t is always zero for the first reconst_bs entries, so for eval its just always zero (batch size is always 1)
         # First entries of t are used for reconst_loss below
         t[:reconst_bs] = 0
         # Low-discrepancy sampler for the remaining entries of t
@@ -224,7 +197,7 @@ def main(**args):
         if train_mode:
             t[reconst_bs:] += float(np.random.RandomState(step).uniform())
         else:
-            t[reconst_bs:] += float(np.random.uniform())
+            t[reconst_bs:] += float(np.random.uniform()) # Jakob: eval will randomly add to the t 7/8th of the time, and it will add a uniform (0,1) random float else t is zero.
         t[reconst_bs:] /= batch_size - reconst_bs
         t.requires_grad = True
 
@@ -263,7 +236,7 @@ def main(**args):
         gamma = gamma_0 + (gamma_1 - gamma_0) * gamma
         gamma_prime = (gamma_1 - gamma_0) * gamma_prime
 
-        gamma = torch.lerp(gamma, gamma.detach(), selfcond_mask)
+        gamma = torch.lerp(gamma, gamma.detach(), selfcond_mask) # self cond mask is always 1, so you don't update for eval
         gamma_prime = torch.lerp(gamma_prime, gamma_prime.detach(), selfcond_mask)
 
         # Quantities derived from gamma, gamma_prime, gamma_1:
@@ -276,22 +249,15 @@ def main(**args):
         sigma_1 = torch.sigmoid(gamma_1).sqrt()
 
         # Construct z (with reparam. trick gradients)
-        x_embed = embedding_matrix[x] # B x Seq x 16
+        x_embed = embedding_matrix[x]
         x_embed = torch.lerp(x_embed, x_embed.detach(), selfcond_mask.float()[:,None,None])
-        if "BoW_embedding" in args.diffusion_mode:
-            # x_embed = x_embed.cumsum(dim=-2) # along the sequence dimension.
-            # import ipdb; ipdb.set_trace()
-            seq_len = x_embed.shape[-2]
-            x_embed_bow = torch.einsum("bse,sn->bne", x_embed, torch.tril(args.BoW_cumsum_gamma ** ((torch.tril(torch.tile(torch.arange(seq_len).reshape(-1,1), (1, seq_len)) - torch.arange(seq_len).reshape(1,-1))))).T.float()).float()
-            recomputed_x_embed = x_embed_bow[:,1:,:] - x_embed_bow[:,:-1,:] * args.BoW_cumsum_gamma
-            assert torch.max(torch.abs(recomputed_x_embed - x_embed[:,1:,:])) < 0.1, f"cumsum along sequence dimension is not correct {recomputed_x_embed}, {x_embed[:,1:,:]}"
-            x_embed = x_embed_bow
         z = torch.randn(
             [x.shape[0], x.shape[1], args.embed_dim],
             dtype=torch.float32, device='cuda'
         )
+
+        # z = torch.tile(embedding_matrix.detach()[262][None, None, :], dims=(x.shape[0], x.shape[1], 1))
         z.mul_(sigma[:,None,None])
-        # noise = z.clone().detach()
         z.add_(alpha[:,None,None] * x_embed)
 
         cu_seqlens = None
@@ -319,44 +285,29 @@ def main(**args):
 
         # Model forward pass for self-conditioning
         x_selfcond = torch.zeros_like(z)
-        if len(selfcond_idx) > 0:
+        if len(selfcond_idx) > 0: # Jakob: Does the self conditioning happen only for t-1 of the t you are computing? not just feeding forward the prediction from the last one?
             with torch.no_grad():
                 z_selfcond = z[selfcond_idx]
                 gamma_selfcond = gamma[selfcond_idx]
-                model_res = ddp_modules['model'](
+                logits, x_reconst = ddp_modules['model'](
                     z_selfcond, gamma_selfcond, embedding_matrix, bias_scale,
                     torch.zeros_like(z_selfcond),
-                    diffusion_mode=args.diffusion_mode,
-                    BoW_cumsum_gamma=args.BoW_cumsum_gamma,
                     cu_seqlens=cu_seqlens_selfcond
                 )
-                if isinstance(model_res, tuple):
-                    logits, x_reconst = model_res
-                else:
-                    logits = model_res['logits']
-                    x_reconst = model_res['x_reconst']
-                del logits, model_res
+                del logits
                 x_selfcond[selfcond_idx] = x_reconst
 
         # Main model forward pass
-        with torch.enable_grad():
-            model_res = ddp_modules['model'](
+        with torch.enable_grad(): # Jakob: Does this negate the above no_grad? It seems to in testing, this would cost forward step a lot of memory for maintaining grads.
+            logits, x_reconst = ddp_modules['model'](
                 z, gamma, embedding_matrix, bias_scale, x_selfcond,
                 selfcond_mask=selfcond_mask,
-                diffusion_mode=args.diffusion_mode,
-                BoW_cumsum_gamma=args.BoW_cumsum_gamma,
                 cu_seqlens=cu_seqlens
             )
-            if isinstance(model_res, tuple):
-                logits, x_reconst = model_res
-            else:
-                logits = model_res['logits']
-                x_reconst = model_res['x_reconst']
-                
 
         # Loss terms
         reconst_loss = lib.ops.cross_entropy(
-            logits[:reconst_bs],
+            logits[:reconst_bs], # Jakob reconst_bs is 0 7/8 ths of the time for eval, so reconst_loss is empty 7/8ths of the time for eval.
             x[:reconst_bs]
         ).mean(dim=1).double()
 
@@ -367,11 +318,11 @@ def main(**args):
             sigma_1_masked,
             torch.tensor(0., device='cuda'),
             torch.tensor(1., device='cuda')
-        ).sum(dim=2).mean()
+        ).sum(dim=2).mean() # the difference between the 0,1 gaussian and alpha * x_embed, sigma gaussians.
 
         diffusion_loss = (x_embed - x_reconst).pow(2)
         diffusion_loss = diffusion_loss.mean(dim=1).double().sum(dim=1)
-        diffusion_loss = -0.5*(snr_prime * diffusion_loss)
+        diffusion_loss = -0.5*(snr_prime * diffusion_loss) # Jakob: MSE diffusion loss equation
 
         if train_mode:
             with torch.no_grad():
@@ -383,10 +334,10 @@ def main(**args):
 
         grad_hook_loss = diffusion_loss # Used above (weird variable scope)
 
-        loss = (args.reconst_weight * reconst_loss).sum() / avg_reconst_bs
+        loss = (args.reconst_weight * reconst_loss).sum() / avg_reconst_bs # Jakob: avg_reconst_bs is 1/8 in eval
         loss += diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)
         loss += prior_loss
-        
+
         if args.selfcond:
             nll = (reconst_loss * selfcond_mask[:reconst_bs]).sum() / (avg_reconst_bs * avg_selfcond_mask)
             nll += (diffusion_loss[reconst_bs:] * selfcond_mask[reconst_bs:]).sum() / ((batch_size - avg_reconst_bs) * avg_selfcond_mask)
@@ -396,52 +347,15 @@ def main(**args):
             nll += diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)
             nll += prior_loss
 
-        ret_dict = {
-            'loss': loss,
-            'nll': nll,
-            'reconst': reconst_loss.sum() / avg_reconst_bs,
-            'prior': prior_loss,
-            'gamma_0': gamma_0,
-            'gamma_1': gamma_1,
-            'reconst_bs': torch.tensor(reconst_bs).cuda(),
-            'diffusion': (diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)).item(),
-        }
-        log_dict = {k: float(v) for k, v in ret_dict.items()}
-        if step and step % 100 == 0:
-            with torch.no_grad():
-                sometimes_log = {}
-                mat = ddp_modules['embedding_matrix'](unnormalize=True)
-                sometimes_log["embed_mat_norm_mean"] = mat.norm(dim=-1).mean()
-                sometimes_log["embed_mat_std"] = mat.std()
-                sometimes_log["embed_sim_mean"] = (embedding_matrix @ embedding_matrix.T).mean()
-                log_dict.update(sometimes_log)
-        log_dict.update({'reconst_bs_ema': reconst_bs, 'bias_scale': bias_scale, 'accum_step': accum_step})
-        
-        if 'logits_secondary' in model_res:
-            logits_secondary = model_res['logits_secondary']
-            reconst_loss_secondary = lib.ops.cross_entropy(
-                logits_secondary[:reconst_bs],
-                x[:reconst_bs]
-            ).mean(dim=1).double()
-            loss += (args.reconst_secondary_weight * reconst_loss_secondary).sum() / avg_reconst_bs
-            if args.selfcond:
-                nll2 = (reconst_loss_secondary * selfcond_mask[:reconst_bs]).sum() / (avg_reconst_bs * avg_selfcond_mask)
-                nll2 += (diffusion_loss[reconst_bs:] * selfcond_mask[reconst_bs:]).sum() / ((batch_size - avg_reconst_bs) * avg_selfcond_mask)
-                nll2 += prior_loss
-            else:
-                nll2 = reconst_loss_secondary.sum() / avg_reconst_bs
-                nll2 += diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)
-                nll2 += prior_loss
-            ret_dict.update({
-                'loss': loss,
-                'nll2': nll2.item(), 
-                'reconst2': (reconst_loss_secondary.sum() / avg_reconst_bs).item(),  
-            })
-            log_dict.update({k: float(v) for k, v in ret_dict.items()})
-        wandb.log(log_dict, step=step)
-
-        return ret_dict
-    
+        return (
+            loss,
+            nll,
+            reconst_loss.sum() / avg_reconst_bs,
+            prior_loss,
+            gamma_0,
+            gamma_1,
+            torch.tensor(reconst_bs).cuda(),
+        )
 
     learning_rates = {
         'model': args.lr,
@@ -454,38 +368,8 @@ def main(**args):
         'model': args.weight_decay,
         'noise_schedule': 0.,
         'gamma_bounds': 1e-3,
-        'embedding_matrix': args.weight_decay_embed,
+        'embedding_matrix': 0.,
     }
-
-    def optimizer_impl(param_groups, **kwargs):
-        assert('weight_decay' not in kwargs)
-        modules_seen = set()
-        for i, param_group in enumerate(param_groups):
-            weight_decay_set = False
-            for name in modules:
-                group_params = param_group['params']
-                module_params = list(modules[name].parameters())
-                if all([any([p is p2 for p2 in module_params]) for p in group_params]):
-                    assert(not weight_decay_set)
-                    assert(param_group['weight_decay'] == 0.)
-                    param_group['weight_decay'] = (
-                        weight_decays[name] / (param_group['lr']+1e-16)
-                    )
-                    weight_decay_set = True
-                    modules_seen.add(name)
-            assert(weight_decay_set)
-        assert(all([name in modules_seen for name in modules]))
-        if args.debug:
-            return optim.AdamW(param_groups, **kwargs)
-        else:
-            return torch.distributed.optim.ZeroRedundancyOptimizer(param_groups,
-                optimizer_class=optim.AdamW, parameters_as_bucket_view=True, **kwargs)
-
-    param_groups = [
-        {'params': modules[name].parameters(), 'lr': learning_rates[name]}
-        for name in modules
-    ]
-    opt = mup.MuAdam(param_groups, impl=optimizer_impl, betas=(args.beta1, args.beta2))
 
     def compute_nll(data_iterator, steps, seq_len=args.seq_len):
         with contextlib.ExitStack() as stack:
@@ -496,7 +380,7 @@ def main(**args):
             total_tokens = 0
             for i, X in tqdm.tqdm(enumerate(data_iterator)):
                 X = X.cuda()[:,:seq_len]
-                nll = forward(x_eval=X)['nll']
+                nll = forward(x_eval=X)[1]
                 total_nll += (nll.item() * X.numel())
                 total_tokens += X.numel()
                 if i == steps:
@@ -511,7 +395,7 @@ def main(**args):
         for ema in emas.values():
             ema.step()
 
-        if step % args.hook_freq == (args.hook_freq - 1): 
+        if step % args.hook_freq == (args.hook_freq - 1):
             val_nll = compute_nll(val_iterator, args.val_steps)
             print(f'NLL (val, seq_len={args.seq_len}): {val_nll}')
             all_val_nlls.append(val_nll)
@@ -522,59 +406,29 @@ def main(**args):
             if lib.ddp.rank() == 0:
                 # Save weights
                 if args.save_weights:
-                    os.makedirs(args.model_save_path, exist_ok=True)
                     for name in modules:
                         with emas[name].enabled():
-                            torch.save(modules[name].state_dict(), os.path.join(args.model_save_path, f'{name}.pt'))
-                    with open(os.path.join(args.model_save_path, 'step'), 'w') as f:
+                            torch.save(modules[name].state_dict(), f'{name}.pt')
+                    with open('step', 'w') as f:
                         f.write(str(step))
                     print('Saved weights!')
-                
-                wandb.log({"hook_val_nll": val_nll}, step=step) 
-                
-                # TODO: fix memory error. Too much is allocated to main process and unable to validate because cant load new model for the subprocess. Maybe just run the sampling as a function with the already existing model and disable gradients.
-                subprocess.run(["python", "sample.py", "--just_unconditional=True", f"--weights_path={args.model_save_path}", f"--dim={args.dim}", f"--n_blocks={args.n_blocks}", f"--n_heads={args.n_heads}", f"--seq_len={args.seq_len}", f"--diffusion_mode={args.diffusion_mode}", f"--BoW_cumsum_gamma={args.BoW_cumsum_gamma}"], capture_output=True)
 
                 # Save gamma plot
                 t = torch.linspace(0., 1., 1024).cuda()
                 gamma = modules['noise_schedule'](t)
                 plt.clf()
                 plt.plot(t.detach().cpu().numpy(), gamma.detach().cpu().numpy())
-                plt.savefig(os.path.join(args.model_save_path, f'gamma_{step}.jpg'))
-                #, "hook_matrix_mean": modules["embedding_matrix"].matrix.data.mean().item(), "hook_matrix_std": modules["embedding_matrix"].matrix.data.std().item(), f"hook_gamma_{step}_image": wandb.Image(os.path.join(args.model_save_path, f'gamma_{step}.jpg'))}, step=step)
+                plt.savefig(f'gamma_{step}.jpg')
 
     print('Starting train loop...')
-    lib.utils.train_loop(
-        forward,
-        opt,
-        args.steps,
-        args.steps_max_for_lr_sched,
-        args.lr_scheduler,
-        names=['nll','reconst','prior','gamma_0','gamma_1','reconst_bs'] + (['nll2','reconst2','diffusion'] if 'double_logit_reg' in args.diffusion_mode else []),
-        hook=hook,
-        print_freq=args.print_freq,
-        lr_warmup_steps=args.lr_warmup_steps,
-        lr_decay=args.lr_decay,
-        amp_grad_scaler=False,
-        grad_accum_steps=args.grad_accum_steps,
-        ddp_models=ddp_modules.values(),
-        first_step=first_step,
-        clip_params=[
-            param
-            for module in modules.values()
-            for param in module.parameters()
-        ],
-        clip_quantile=args.clip_quantile,
-        debug=args.debug
-    )
-
     final_val_nll = compute_nll(val_iterator, args.final_val_steps)
     print('Final val NLL:', final_val_nll)
     if args.seq_len != 256:
         final_val_nll_256 = compute_nll(val_iterator, args.final_val_steps, seq_len=256)
         print('Final val NLL (seq_len=256):', final_val_nll_256)
-    wandb.log({"hook_val_nll": final_val_nll}, step=args.steps)
+
     return all_val_nlls, final_val_nll
 
 if __name__ == '__main__':
-    fire.Fire(lib.ddp.wrap_main(main))
+    # fire.Fire(lib.ddp.wrap_main(main, manual_word_size=1))
+    fire.Fire(main)

@@ -9,6 +9,7 @@ import torch
 import types
 import warnings
 from torch import nn, optim
+import wandb
 
 class AttributeDict(dict):
     def __getattr__(self, attr):
@@ -60,6 +61,8 @@ def train_loop(
     forward,
     opt,
     steps,
+    steps_max_for_lr_sched,
+    lr_scheduler,
     names=[],
     hook=None,
     print_freq=1000,
@@ -70,7 +73,8 @@ def train_loop(
     grad_accum_steps=1,
     ddp_models=[],
     clip_params=[],
-    clip_quantile=0.95
+    clip_quantile=0.95,
+    debug=False,
     ):
 
     def lr_fn(step):
@@ -81,11 +85,13 @@ def train_loop(
             return float(step) / lr_warmup_steps
         elif lr_decay:
             # Linear to zero
-            return 1. - (float(step-lr_warmup_steps) / (1e-8+steps-lr_warmup_steps))
+            if lr_scheduler == "linear":
+                return 1. - (float(step-lr_warmup_steps) / (1e-8+steps_max_for_lr_sched-lr_warmup_steps))
+            elif lr_scheduler == "cosine":
+                return 1/2 * (1 + np.cos(np.pi * ((step-lr_warmup_steps)%(steps_max_for_lr_sched // 10))/(steps_max_for_lr_sched // 10)))
         else:
             return 1.
     scheduler = optim.lr_scheduler.LambdaLR(opt, lr_fn)
-
     print_row('step', 'step time', 'loss', *names, 'grad norm', 'mem')
     histories = collections.defaultdict(lambda: [])
     scaler = torch.cuda.amp.GradScaler(enabled=amp_grad_scaler)
@@ -102,7 +108,7 @@ def train_loop(
         for accum_step in range(grad_accum_steps):
 
             with contextlib.ExitStack() as stack:
-                if accum_step < grad_accum_steps - 1:
+                if accum_step < grad_accum_steps - 1 and not debug:
                     for m in ddp_models:
                         stack.enter_context(m.no_sync())
 
@@ -111,17 +117,28 @@ def train_loop(
                     (accum_step * lib.ddp.world_size()) + lib.ddp.rank(),
                     lib.ddp.world_size() * grad_accum_steps
                 )
-                if not isinstance(forward_vals, tuple):
+                if isinstance(forward_vals, dict):
+                    scaled_loss = forward_vals['loss'] / grad_accum_steps
+                    scaler.scale(scaled_loss).backward()
+                elif not isinstance(forward_vals, tuple):
                     forward_vals = (forward_vals,)
-
-                scaled_loss = forward_vals[0] / grad_accum_steps
-                scaler.scale(scaled_loss).backward()
-
-            histories['loss'].append(forward_vals[0].item())
-            for name, val in zip(names, forward_vals[1:]):
-                histories[name].append(val.item())
-
-            del forward_vals
+                if isinstance(forward_vals, tuple):
+                    scaled_loss = forward_vals[0] / grad_accum_steps
+                    scaler.scale(scaled_loss).backward()
+            if isinstance(forward_vals, dict):
+                # names = list(forward_vals.keys())
+                for name, val in forward_vals.items():
+                    if isinstance(val, torch.Tensor):
+                        val = val.item()
+                    else:
+                        val = float(val)
+                    histories[name].append(val)
+                del forward_vals
+            else:
+                histories['loss'].append(forward_vals[0].item())
+                for name, val in zip(names, forward_vals[1:]):
+                    histories[name].append(val.item())
+                del forward_vals
 
         scaler.unscale_(opt)
         with torch.no_grad():
@@ -147,10 +164,12 @@ def train_loop(
                 step,
                 means['step_time'],
                 means['loss'],
-                *[means[name] for name in names],
+                *[means[name] for name in names if name != 'loss'],
                 means['grad_norm'],
                 torch.cuda.max_memory_allocated() / (1024**3)
             )
+            means["lr_sched"] = lr_fn(step)
+            wandb.log({"avg_"+k: v for k, v in means.items()}, step=step)
             histories.clear()
 
         if hook is not None:

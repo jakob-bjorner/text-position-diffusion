@@ -14,18 +14,19 @@ import torch.nn.utils.rnn
 from tokenizers import Tokenizer
 
 # Generate using misc/owt2_preprocess.py
-OPENWEBTEXT2_DATA_DIR = '/REPLACE_ME'
+# Jakob: Generate using misc/owt_preprocess.py
+OPENWEBTEXT2_DATA_DIR = '/srv/flash2/jbjorner3/plaid-model/data/openwebtext-karpathy'
 # https://mattmahoney.net/dc/enwik8.zip
-ENWIK8_PATH           = '/REPLACE_ME/data/enwik8'
+ENWIK8_PATH           = '/srv/flash2/jbjorner3/plaid-model/data/enwik8'
 # https://mattmahoney.net/dc/text8.zip
-TEXT8_PATH            = '/REPLACE_ME/data/text8'
+TEXT8_PATH            = '/srv/flash2/jbjorner3/plaid-model/data/text8'
 # https://github.com/wojzaremba/lstm/blob/master/data/ptb.test.txt
-PTB_PATH              = '/REPLACE_ME/data/ptb/ptb.test.txt'
+PTB_PATH              = '/srv/flash2/jbjorner3/plaid-model/data/ptb/ptb.test.txt'
 # https://www.salesforce.com/products/einstein/ai-research/the-wikitext-dependency-language-modeling-dataset/
-WIKITEXT2_PATH        = '/REPLACE_ME/data/wikitext2.test.tokens'
-WIKITEXT103_PATH      = '/REPLACE_ME/data/wikitext103.test.tokens'
+WIKITEXT2_PATH        = '/srv/flash2/jbjorner3/plaid-model/data/wikitext2.test.tokens'
+WIKITEXT103_PATH      = '/srv/flash2/jbjorner3/plaid-model/data/wikitext-103/wiki.test.tokens'
 # https://www.statmt.org/lm-benchmark/
-BILLIONWORD_PATH      = '/REPLACE_ME/billionword_test_all.txt'
+BILLIONWORD_PATH      = '/srv/flash2/jbjorner3/plaid-model/billionword_test_all.txt'
 
 def _openwebtext2_shard_iterator(shard_name):
     data_dir = OPENWEBTEXT2_DATA_DIR
@@ -316,6 +317,7 @@ def _eval_dataset(
     print(f'Words per token ({dataset_name}):', total_words / total_tokens)
 
     seqs = [dataset[None,i:i+seq_len] for i in range(0, len(dataset), seq_len)]
+    print(f"Number of iterations for ({dataset_name}):", len(seqs))
     def test_iterator():
         while True:
             np.random.shuffle(seqs)

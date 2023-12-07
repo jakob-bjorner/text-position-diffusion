@@ -15,10 +15,11 @@ def _worker_fn(rank, world_size, main_fn, args_dict):
         sys.stdout = open('/dev/null', 'w')
 
     # Main function
-    main_fn(**args_dict)
+    res = main_fn(**args_dict)
 
     # Cleanup
     dist.destroy_process_group()
+    return res
 
 
 def _torchrun_worker_fn(main_fn, args_dict):
@@ -31,30 +32,34 @@ def _torchrun_worker_fn(main_fn, args_dict):
         sys.stdout = open('/dev/null', 'w')
 
     # Main function
-    main_fn(**args_dict)
+    res = main_fn(**args_dict)
 
     # Cleanup
     dist.destroy_process_group()
+    return res
 
 
-def wrap_main(main_fn):
+def wrap_main(main_fn, manual_word_size=None):
     """
     Usage: instead of calling main() directly, call wrap_main(main)().
     main should take only kwargs.
     """
     world_size = torch.cuda.device_count()
+    if manual_word_size is not None:
+        world_size = manual_word_size
     def main(**args):
         if 'RANK' in os.environ:
             mp.set_start_method('spawn')
-            _torchrun_worker_fn(main_fn, args)
+            return _torchrun_worker_fn(main_fn, args)
         else:
             os.environ['PYTHONUNBUFFERED'] = '1'
             os.environ['MASTER_ADDR'] = 'localhost'
             os.environ['MASTER_PORT'] = str(random.randint(1024, 65536))
             mp.set_start_method('spawn')
             if world_size == 1:
-                _worker_fn(0, world_size, main_fn, args)
+                return _worker_fn(0, world_size, main_fn, args)
             else:
+                print("____Jakob Note: using mp.spawn. No return for nevergrad.____")
                 mp.spawn(
                     _worker_fn,
                     (world_size, main_fn, args),
@@ -71,8 +76,9 @@ def wrap_main_torchrun(main_fn):
         mp.set_start_method('spawn')
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend='nccl')
-        main_fn(args)
+        res = main_fn(args)
         dist.destroy_process_group()
+        return res
     return main
 
 
